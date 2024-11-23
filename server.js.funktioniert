@@ -1,0 +1,158 @@
+const express = require('express');
+const fetch = require('node-fetch');
+const cors = require('cors'); // Importiere das CORS-Paket
+
+const app = express();
+const PORT = 3000;
+
+// Liste der erlaubten Domains
+const allowedOrigins = [
+  'https://tapp-staging.chayns-static.space',
+  'https://chayns.space',
+];
+
+// CORS-Einstellungen für mehrere Domains
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // Überprüfen, ob die anfragende Domain in der Whitelist ist
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('Nicht erlaubter Zugriff durch CORS'));
+      }
+    },
+    methods: 'GET, POST', // Erlaubt nur bestimmte Methoden
+    allowedHeaders: 'Content-Type, Authorization', // Erlaubt bestimmte Header
+  })
+);
+
+let isRunning = false;
+let lastExecutionTime = 0; // Speichert die Zeit der letzten Ausführung, um Wiederholungen zu vermeiden
+
+// API-Konstanten für Govee und Geräteinformationen
+const API_URL = 'https://openapi.api.govee.com/router/api/v1/device/control';
+const API_KEY = '53d1566a-290b-4c66-af76-b1bc8726371a'; // Ersetze diesen Wert durch den tatsächlichen API-Schlüssel
+
+// Array, das Informationen zu jeder Lichterkette enthält, die gesteuert wird
+const LIGHTS = [
+  { id: '0B:C8:C4:75:45:E6:77:48', name: 'Funkel-Lichterkette 1' },
+  { id: 'D1:47:C4:75:45:E6:50:02', name: 'Funkel-Lichterkette 2' },
+  { id: '1C:BD:C5:75:B6:0E:53:A2', name: 'Funkel-Lichterkette 3' },
+  { id: '0D:07:C5:75:B6:0E:7E:5D', name: 'Funkel-Lichterkette 4' }
+];
+
+/**
+ * Führt eine Anfrage an die angegebene URL aus, mit den definierten Methoden, Kopfzeilen und Inhalten.
+ * Verwendet die fetch-API, um die Govee-Geräte zu steuern und verarbeitet die Antwort.
+ */
+async function controlDevice(url, method = 'GET', body = null, headers = {}) {
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: body ? JSON.stringify(body) : null,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Fehler: ${response.status} ${response.statusText}`);
+    }
+
+    const contentType = response.headers.get('content-type');
+    if (contentType && contentType.includes('application/json')) {
+      const data = await response.json();
+      console.log('Response:', data);
+      return data;
+    } else {
+      console.log('Response:', await response.text());
+      return {};
+    }
+  } catch (error) {
+    console.error('Error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Schaltet alle im LIGHTS-Array definierten Lichterketten ein oder aus.
+ */
+async function controlLights(value) {
+  for (const light of LIGHTS) {
+    console.log(`${light.name} ${value === 1 ? 'einschalten' : 'ausschalten'}`);
+    await controlDevice(
+      API_URL,
+      'POST',
+      {
+        requestId: 'uuid', // Universelle eindeutige ID, kann nach Bedarf angepasst werden
+        payload: {
+          sku: 'H70C7',
+          device: light.id,
+          capability: {
+            type: 'devices.capabilities.on_off',
+            instance: 'powerSwitch',
+            value: value,
+          },
+        },
+      },
+      { 'Govee-API-Key': API_KEY }
+    );
+  }
+}
+
+// Route '/start-scene' - startet die Szene mit bestimmten Verzögerungen und Ausschaltlogik.
+app.get('/start-scene', cors(), async (req, res) => {
+  const now = Date.now();
+
+  // Überprüfung, ob die letzte Ausführung weniger als 3 Minuten zurückliegt
+  const timeSinceLastExecution = now - lastExecutionTime;
+  const timeRemaining = 3 * 60 * 1000 - timeSinceLastExecution;
+
+  if (timeSinceLastExecution < 3 * 60 * 1000) {
+    const timeInMinutes = Math.floor(timeRemaining / 1000 / 60);
+    const timeInSeconds = Math.floor((timeRemaining / 1000) % 60);
+
+    let timeMessage;
+    if (timeInMinutes > 0) {
+      const minuteText = timeInMinutes === 1 ? "Minute" : "Minuten";
+      timeMessage = `Der Horst kann erst in ${timeInMinutes} ${minuteText} und ${timeInSeconds} Sekunden erneut funkeln.`;
+    } else {
+      timeMessage = `Der Horst kann erst in ${timeInSeconds} Sekunden erneut funkeln.`;
+    }
+
+    return res.status(429).json({
+      message: timeMessage,
+    });
+  }
+
+  // Überprüfung, ob die Szene bereits läuft
+  if (isRunning) {
+    return res.status(429).json({
+      message: 'Szene läuft bereits. Bitte warten Sie, bis sie abgeschlossen ist.',
+    });
+  }
+
+  isRunning = true;
+  lastExecutionTime = now; // Setzt die Zeit der aktuellen Ausführung
+  try {
+    console.log('Normales Licht ausschalten');
+    await controlDevice('https://run.chayns.codes/9b9d80a2'); // Externe Steuerung für normales Licht
+
+    await controlLights(1); // Beide Lichterketten einschalten
+    await new Promise((resolve) => setTimeout(resolve, 30000)); // Längere Verzögerung von 30 Sekunden
+    await controlLights(0); // Beide Lichterketten ausschalten
+
+    console.log('Normales Licht wieder einschalten');
+    await controlDevice('https://run.chayns.codes/f6cc8146'); // Externe Steuerung zum Wiedereinschalten des normalen Lichts
+
+    res.json({ message: 'Szene erfolgreich abgeschlossen.' });
+  } catch (error) {
+    res.status(500).json({ message: 'Fehler beim Ausführen der Szene.' });
+  } finally {
+    isRunning = false; // Setzt den Status der Szene zurück
+  }
+});
+
+// Startet den Express-Server auf dem definierten Port
+app.listen(PORT, () => {
+  console.log(`Service läuft auf http://localhost:${PORT}`);
+});
